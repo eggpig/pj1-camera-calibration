@@ -17,6 +17,8 @@ BOARD = np.column_stack((SQUARE_MM * GRID, np.zeros(len(GRID)))).astype(np.float
 DETECT_FLAGS = cv.CALIB_CB_NORMALIZE_IMAGE | cv.CALIB_CB_EXHAUSTIVE | cv.CALIB_CB_ACCURACY
 FIT_FLAGS = cv.CALIB_FIX_K3 | cv.CALIB_ZERO_TANGENT_DIST
 CRITERIA = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_MAX_ITER, 200, 1e-10)
+FIXED_CORNER = PATTERN[0] - 1
+ANCHORS = (0, FIXED_CORNER, len(BOARD) - 1)
 
 
 @dataclass
@@ -57,11 +59,16 @@ def load_views(directory: Path) -> tuple[list[View], tuple[int, int]]:
     return views, (width, height)
 
 
-def calibrate(board, observations, size) -> Calibration:
-    rms, matrix, distortion, rotations, translations = cv.calibrateCamera(
-        [board] * len(observations), observations, size,
+def calibrate(indices, observations, size, refine_board: bool) -> Calibration:
+    board = BOARD[indices]
+    corners = [points[indices] for points in observations]
+    fixed = int(np.searchsorted(indices, FIXED_CORNER)) if refine_board else -1
+    rms, matrix, distortion, rotations, translations, adjusted_board = cv.calibrateCameraRO(
+        [board] * len(corners), corners, size, fixed,
         None, None, flags=FIT_FLAGS, criteria=CRITERIA,
     )
+    if refine_board:
+        board = adjusted_board.reshape(-1, 3)
     return Calibration(rms, matrix, distortion, rotations, translations, board)
 
 
@@ -78,6 +85,34 @@ def squared_errors(fit: Calibration, observations) -> np.ndarray:
         np.sum((pose_projection(fit, fit.board, index) - corners) ** 2, axis=(1, 2))
         for index, corners in enumerate(observations)
     ])
+
+
+def held_out_errors(observations, size, refine_board: bool) -> np.ndarray:
+    """Fit on three parity groups, then predict omitted corners in the third view."""
+    indices = np.arange(len(BOARD))
+    parity = GRID[:, 0] % 2 + 2 * (GRID[:, 1] % 2)
+    squared = [[] for _ in observations]
+    for fold in range(4):
+        omitted = (parity == fold) & ~np.isin(indices, ANCHORS)
+        fit = calibrate(indices[~omitted], observations, size, refine_board)
+        rays = [
+            cv.undistortPoints(points[omitted].astype(np.float64), fit.matrix, fit.distortion)
+            .reshape(-1, 2).T
+            for points in observations
+        ]
+        poses = [
+            np.column_stack((cv.Rodrigues(rotation)[0], translation))
+            for rotation, translation in zip(fit.rotations, fit.translations)
+        ]
+        for index, points in enumerate(observations):
+            first, second = [other for other in range(len(observations)) if other != index]
+            homogeneous = cv.triangulatePoints(
+                poses[first], poses[second], rays[first], rays[second],
+            ).T
+            reconstructed = homogeneous[:, :3] / homogeneous[:, 3:]
+            residual = pose_projection(fit, reconstructed, index) - points[omitted]
+            squared[index].extend(np.sum(residual ** 2, axis=(1, 2)))
+    return np.asarray(squared)
 
 
 def rmse(squared: np.ndarray) -> float:
@@ -165,11 +200,16 @@ def main() -> None:
     except (OSError, ValueError, cv.error) as error:
         parser.error(str(error))
     observations = [view.corners for view in views]
-    fits = [("Fixed board", calibrate(BOARD, observations, size))]
-    metrics = [(name, "fit", squared_errors(fit, observations)) for name, fit in fits]
-    for (name, fit), (_, _, squared) in zip(fits, metrics):
+    fits = []
+    metrics = []
+    for name, refine_board in (("Fixed board", False), ("Refined board", True)):
+        fit = calibrate(np.arange(len(BOARD)), observations, size, refine_board)
+        squared = squared_errors(fit, observations)
         if not np.isclose(fit.rms, rmse(squared), atol=1e-6):
             raise RuntimeError(f"Recomputed RMSE disagrees with OpenCV: {name}")
+        fits.append((name, fit))
+        metrics.append((name, "fit", squared))
+        metrics.append((name, "held_out", held_out_errors(observations, size, refine_board)))
 
     args.output.mkdir(parents=True, exist_ok=True)
     write_tables(args.output, [view.name for view in views], fits, metrics)
