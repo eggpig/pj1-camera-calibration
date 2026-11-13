@@ -3,10 +3,13 @@
 import argparse
 import csv
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import cv2 as cv
 import numpy as np
+from scipy.linalg import null_space
+from scipy.optimize import least_squares
 
 
 IMAGE_NAMES = ("11.jpg", "12.jpg", "18.jpg")
@@ -19,6 +22,12 @@ FIT_FLAGS = cv.CALIB_FIX_K3 | cv.CALIB_ZERO_TANGENT_DIST
 CRITERIA = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_MAX_ITER, 200, 1e-10)
 FIXED_CORNER = PATTERN[0] - 1
 ANCHORS = (0, FIXED_CORNER, len(BOARD) - 1)
+
+
+class Method(Enum):
+    FIXED = "Fixed board"
+    STROBL = "Refined board"
+    PLANAR = "Planar constraint"
 
 
 @dataclass
@@ -59,9 +68,10 @@ def load_views(directory: Path) -> tuple[list[View], tuple[int, int]]:
     return views, (width, height)
 
 
-def calibrate(indices, observations, size, refine_board: bool) -> Calibration:
+def calibrate(indices, observations, size, method: Method) -> Calibration:
     board = BOARD[indices]
     corners = [points[indices] for points in observations]
+    refine_board = method is Method.STROBL
     fixed = int(np.searchsorted(indices, FIXED_CORNER)) if refine_board else -1
     rms, matrix, distortion, rotations, translations, adjusted_board = cv.calibrateCameraRO(
         [board] * len(corners), corners, size, fixed,
@@ -69,7 +79,75 @@ def calibrate(indices, observations, size, refine_board: bool) -> Calibration:
     )
     if refine_board:
         board = adjusted_board.reshape(-1, 3)
-    return Calibration(rms, matrix, distortion, rotations, translations, board)
+    fit = Calibration(rms, matrix, distortion, rotations, translations, board)
+    if method is Method.PLANAR:
+        return optimize_planar_reference(fit, corners)
+    return fit
+
+
+def deviation_basis(board: np.ndarray) -> np.ndarray:
+    """Use the ideal grid to fix the origin, orientation and scale of the board."""
+    centered = (board - board.mean(axis=0)) / SQUARE_MM
+    translations = np.broadcast_to(np.eye(3)[:, None, :], (3, len(board), 3))
+    rotations = np.cross(np.eye(3)[:, None, :], centered[None, :, :])
+    scale = centered[None, :, :]
+    constraints = np.concatenate((translations, rotations, scale)).reshape(7, -1)
+    # Coordinates in the null space satisfy all seven constraints exactly.
+    return null_space(constraints)
+
+
+def optimize_planar_reference(initial: Calibration, observations) -> Calibration:
+    """Jointly fit per-corner 3D offsets, lens parameters and the board poses."""
+    nominal = initial.board.astype(np.float64)
+    basis = deviation_basis(nominal)
+    point_basis = basis.reshape(len(nominal), 3, -1)
+    views = len(observations)
+    pose_end = 6 + 6 * views
+    starting_intrinsics = initial.matrix[[0, 1, 0, 1], [0, 1, 2, 2]]
+    starting_rotations = np.asarray(initial.rotations).reshape(views, 3)
+    starting_translations = np.asarray(initial.translations).reshape(views, 3)
+    starting_poses = np.column_stack((starting_rotations, starting_translations))
+    start = np.concatenate((starting_intrinsics, initial.distortion.ravel()[:2],
+                            starting_poses.ravel(), np.zeros(basis.shape[1])))
+
+    def unpack(values):
+        fx, fy, cx, cy, k1, k2 = values[:6]
+        matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        distortion = np.array([k1, k2, 0.0, 0.0, 0.0])
+        poses = values[6:pose_end].reshape(views, 6)
+        offsets = np.einsum("nck,k->nc", point_basis, values[pose_end:])
+        board = nominal + offsets
+        return matrix, distortion, poses[:, :3], poses[:, 3:], board
+
+    def residuals(values):
+        matrix, distortion, rotations, translations, board = unpack(values)
+        return np.concatenate([
+            (cv.projectPoints(board, rotation, translation, matrix, distortion)[0] - pixels).ravel()
+            for rotation, translation, pixels in zip(rotations, translations, observations)
+        ])
+
+    def jacobian(values):
+        matrix, distortion, rotations, translations, board = unpack(values)
+        block_rows = 2 * len(board)
+        result = np.zeros((views * block_rows, values.size))
+        for index, (rotation, translation) in enumerate(zip(rotations, translations)):
+            _, jac = cv.projectPoints(board, rotation, translation, matrix, distortion)
+            rows = slice(index * block_rows, (index + 1) * block_rows)
+            pose_column = 6 + 6 * index
+            result[rows, :6] = jac[:, 6:12]  # fx, fy, cx, cy, k1, k2
+            result[rows, pose_column:pose_column + 6] = jac[:, :6]
+            # Translation derivatives are wrt camera coordinates. Rotate to board coordinates.
+            point_jac = jac[:, 3:6].reshape(-1, 2, 3) @ cv.Rodrigues(rotation)[0]
+            result[rows, pose_end:] = (point_jac @ point_basis).reshape(block_rows, -1)
+        return result
+
+    solved = least_squares(residuals, start, jac=jacobian, method="lm", x_scale="jac",
+                           ftol=1e-10, xtol=1e-10, gtol=1e-10, max_nfev=200)
+    if not solved.success:
+        raise RuntimeError(f"Planar constraint optimization failed: {solved.message}")
+    matrix, distortion, rotations, translations, board = unpack(solved.x)
+    rms = rmse(np.sum(solved.fun.reshape(-1, 2) ** 2, axis=1))
+    return Calibration(rms, matrix, distortion, tuple(rotations), tuple(translations), board)
 
 
 def pose_projection(fit: Calibration, points, index: int) -> np.ndarray:
@@ -87,14 +165,14 @@ def squared_errors(fit: Calibration, observations) -> np.ndarray:
     ])
 
 
-def held_out_errors(observations, size, refine_board: bool) -> np.ndarray:
+def held_out_errors(observations, size, method: Method) -> np.ndarray:
     """Fit on three parity groups, then predict omitted corners in the third view."""
     indices = np.arange(len(BOARD))
     parity = GRID[:, 0] % 2 + 2 * (GRID[:, 1] % 2)
     squared = [[] for _ in observations]
     for fold in range(4):
         omitted = (parity == fold) & ~np.isin(indices, ANCHORS)
-        fit = calibrate(indices[~omitted], observations, size, refine_board)
+        fit = calibrate(indices[~omitted], observations, size, method)
         rays = [
             cv.undistortPoints(points[omitted].astype(np.float64), fit.matrix, fit.distortion)
             .reshape(-1, 2).T
@@ -202,14 +280,15 @@ def main() -> None:
     observations = [view.corners for view in views]
     fits = []
     metrics = []
-    for name, refine_board in (("Fixed board", False), ("Refined board", True)):
-        fit = calibrate(np.arange(len(BOARD)), observations, size, refine_board)
+    for method in Method:
+        name = method.value
+        fit = calibrate(np.arange(len(BOARD)), observations, size, method)
         squared = squared_errors(fit, observations)
         if not np.isclose(fit.rms, rmse(squared), atol=1e-6):
-            raise RuntimeError(f"Recomputed RMSE disagrees with OpenCV: {name}")
+            raise RuntimeError(f"Recomputed RMSE disagrees with the optimizer: {name}")
         fits.append((name, fit))
         metrics.append((name, "fit", squared))
-        metrics.append((name, "held_out", held_out_errors(observations, size, refine_board)))
+        metrics.append((name, "held_out", held_out_errors(observations, size, method)))
 
     args.output.mkdir(parents=True, exist_ok=True)
     write_tables(args.output, [view.name for view in views], fits, metrics)
