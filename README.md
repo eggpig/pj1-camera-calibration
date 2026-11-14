@@ -6,7 +6,7 @@
 | --- | --- |
 | 张正友固定棋盘法 | [main](https://github.com/eggpig/pj1-camera-calibration/tree/main) |
 | 固定棋盘法与 Strobl 2011 | [refine-board](https://github.com/eggpig/pj1-camera-calibration/tree/refine-board) |
-| 上述两种方法与参考 Huang 2024 的单目实现 | [planar-constraint](https://github.com/eggpig/pj1-camera-calibration/tree/planar-constraint) |
+| 上述两种方法与Huang 等（2024）的单目标定 | [planar-constraint](https://github.com/eggpig/pj1-camera-calibration/tree/planar-constraint) |
 
 ## 运行代码
 
@@ -37,7 +37,7 @@ pj1-camera-calibration/
 
 ### 3. 安装依赖并运行
 
-使用 Python 3.12。该分支使用NumPy 2.2.6、OpenCV 4.12.0，安装版本由 `requirements.txt` 固定。程序在 CPU 上运行。本项目在 macOS Apple Silicon 上验证。
+使用 Python 3.12。该分支使用 NumPy 2.2.6、OpenCV 4.12.0，安装版本由 `requirements.txt` 固定。程序在 CPU 上运行。本项目在 macOS Apple Silicon 上验证。
 
 **macOS / Linux**
 
@@ -68,23 +68,9 @@ py -3.12 -m venv .venv
 
 ## 方法与结果
 
-程序先找到照片里的棋盘交点，再用相机模型预测这些交点在照片中的位置。程序调整参数，让预测位置尽量贴近检测到的位置。
+固定棋盘法把每个角点放在理想的方格上，估计镜头参数和棋盘在每张照片中的姿态。本分支使用两项径向畸变系数，三张图的拟合 RMSE 为 0.915 像素。
 
-- **固定棋盘**把每个角点放在理想的方格上，估计镜头参数和棋盘在每张照片中的姿态。
-- **Strobl 2011**还会调整角点在棋盘上的三维位置，用三个角点的部分坐标确定棋盘的原点、方向和尺度。
-- **参考 Huang 2024 的单目实现**从理想网格出发，为每个角点估计一个三维偏移，用整块棋盘来确定原点、方向和尺度。
-
-| 方法 | 全量拟合 RMSE（243 个观测） | 留出预测 RMSE（234 个预测） |
-| --- | ---: | ---: |
-| 固定棋盘 | 0.915 px | 0.637 px |
-| Strobl 2011 | 0.095 px | 0.215 px |
-| 参考 Huang 2024 | 0.095 px | 0.215 px |
-
-表中数值来自三方法对比分支对同一组三张图的实测。两种评估的完整结果由三方法对比分支生成。
-
-全量拟合使用全部角点求参数，再检查模型预测的位置与检测位置相差多少。留出评估分四轮，每轮先从三张图中取出同一组角点，用剩下的点求参数。然后用其中两张图里的留出点推算三维位置，预测同一个点在第三张图的位置。三张图轮流作为预测目标，每张得到 78 个预测。Strobl 方法使用的三个坐标锚点在所有方法中始终参与拟合。
-
-两种联合优化的留出误差都约为 0.215 像素。它们允许棋盘角点在三个方向移动，采用不同的坐标定义，最后对这三张照片中的角点给出了几乎相同的预测。
+三种方法的最新对比统一使用 Huang 原文的五项畸变系数。固定划分重复了 5 次，随机角点划分重复了 20 次。运行方法、每轮记录及汇总见 [三方法对比分支](https://github.com/eggpig/pj1-camera-calibration/tree/planar-constraint#重跑结果)。
 
 ## 参考
 
