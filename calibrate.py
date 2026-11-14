@@ -5,10 +5,11 @@ import csv
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from statistics import mean, stdev
 
 import cv2 as cv
 import numpy as np
-from scipy.linalg import null_space
+from scipy.linalg import helmert
 from scipy.optimize import least_squares
 
 
@@ -18,7 +19,6 @@ SQUARE_MM = 50.0
 GRID = np.mgrid[:PATTERN[0], :PATTERN[1]].T.reshape(-1, 2)
 BOARD = np.column_stack((SQUARE_MM * GRID, np.zeros(len(GRID)))).astype(np.float32)
 DETECT_FLAGS = cv.CALIB_CB_NORMALIZE_IMAGE | cv.CALIB_CB_EXHAUSTIVE | cv.CALIB_CB_ACCURACY
-FIT_FLAGS = cv.CALIB_FIX_K3 | cv.CALIB_ZERO_TANGENT_DIST
 CRITERIA = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_MAX_ITER, 200, 1e-10)
 FIXED_CORNER = PATTERN[0] - 1
 ANCHORS = (0, FIXED_CORNER, len(BOARD) - 1)
@@ -27,7 +27,7 @@ ANCHORS = (0, FIXED_CORNER, len(BOARD) - 1)
 class Method(Enum):
     FIXED = "Fixed board"
     STROBL = "Refined board"
-    PLANAR = "Planar constraint"
+    HUANG = "Huang 2024"
 
 
 @dataclass
@@ -75,47 +75,37 @@ def calibrate(indices, observations, size, method: Method) -> Calibration:
     fixed = int(np.searchsorted(indices, FIXED_CORNER)) if refine_board else -1
     rms, matrix, distortion, rotations, translations, adjusted_board = cv.calibrateCameraRO(
         [board] * len(corners), corners, size, fixed,
-        None, None, flags=FIT_FLAGS, criteria=CRITERIA,
+        None, None, criteria=CRITERIA,
     )
     if refine_board:
         board = adjusted_board.reshape(-1, 3)
     fit = Calibration(rms, matrix, distortion, rotations, translations, board)
-    if method is Method.PLANAR:
-        return optimize_planar_reference(fit, corners)
+    if method is Method.HUANG:
+        return optimize_huang(fit, corners)
     return fit
 
 
-def deviation_basis(board: np.ndarray) -> np.ndarray:
-    """Use the ideal grid to fix the origin, orientation and scale of the board."""
-    centered = (board - board.mean(axis=0)) / SQUARE_MM
-    translations = np.broadcast_to(np.eye(3)[:, None, :], (3, len(board), 3))
-    rotations = np.cross(np.eye(3)[:, None, :], centered[None, :, :])
-    scale = centered[None, :, :]
-    constraints = np.concatenate((translations, rotations, scale)).reshape(7, -1)
-    # Coordinates in the null space satisfy all seven constraints exactly.
-    return null_space(constraints)
-
-
-def optimize_planar_reference(initial: Calibration, observations) -> Calibration:
-    """Jointly fit per-corner 3D offsets, lens parameters and the board poses."""
+def optimize_huang(initial: Calibration, observations) -> Calibration:
+    """Solve Huang et al. (2024), Eq. (8), with the equalities in Eq. (7)."""
     nominal = initial.board.astype(np.float64)
-    basis = deviation_basis(nominal)
-    point_basis = basis.reshape(len(nominal), 3, -1)
+    # Helmert columns span exactly the zero-sum offsets in each of X, Y and Z.
+    basis = helmert(len(nominal)).T
     views = len(observations)
-    pose_end = 6 + 6 * views
+    lens_end = 9
+    pose_end = lens_end + 6 * views
     starting_intrinsics = initial.matrix[[0, 1, 0, 1], [0, 1, 2, 2]]
     starting_rotations = np.asarray(initial.rotations).reshape(views, 3)
     starting_translations = np.asarray(initial.translations).reshape(views, 3)
     starting_poses = np.column_stack((starting_rotations, starting_translations))
-    start = np.concatenate((starting_intrinsics, initial.distortion.ravel()[:2],
-                            starting_poses.ravel(), np.zeros(basis.shape[1])))
+    start = np.concatenate((starting_intrinsics, initial.distortion.ravel(),
+                            starting_poses.ravel(), np.zeros(3 * basis.shape[1])))
 
     def unpack(values):
-        fx, fy, cx, cy, k1, k2 = values[:6]
+        fx, fy, cx, cy = values[:4]
         matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-        distortion = np.array([k1, k2, 0.0, 0.0, 0.0])
-        poses = values[6:pose_end].reshape(views, 6)
-        offsets = np.einsum("nck,k->nc", point_basis, values[pose_end:])
+        distortion = values[4:lens_end]
+        poses = values[lens_end:pose_end].reshape(views, 6)
+        offsets = np.einsum("nk,kc->nc", basis, values[pose_end:].reshape(-1, 3))
         board = nominal + offsets
         return matrix, distortion, poses[:, :3], poses[:, 3:], board
 
@@ -133,15 +123,18 @@ def optimize_planar_reference(initial: Calibration, observations) -> Calibration
         for index, (rotation, translation) in enumerate(zip(rotations, translations)):
             _, jac = cv.projectPoints(board, rotation, translation, matrix, distortion)
             rows = slice(index * block_rows, (index + 1) * block_rows)
-            pose_column = 6 + 6 * index
-            result[rows, :6] = jac[:, 6:12]  # fx, fy, cx, cy, k1, k2
+            pose_column = lens_end + 6 * index
+            result[rows, :lens_end] = jac[:, 6:15]  # fx, fy, cx, cy, k1, k2, p1, p2, k3
             result[rows, pose_column:pose_column + 6] = jac[:, :6]
             # Translation derivatives are wrt camera coordinates. Rotate to board coordinates.
             point_jac = jac[:, 3:6].reshape(-1, 2, 3) @ cv.Rodrigues(rotation)[0]
-            result[rows, pose_end:] = (point_jac @ point_basis).reshape(block_rows, -1)
+            offset_jac = np.einsum("nac,nk->nakc", point_jac, basis)
+            result[rows, pose_end:] = offset_jac.reshape(block_rows, -1)
         return result
 
-    solved = least_squares(residuals, start, jac=jacobian, method="lm", x_scale="jac",
+    # Eq. (7) leaves global rotation and scale ambiguity. The exact trust-region
+    # solver uses SVD so the fit can proceed with a rank-deficient Jacobian.
+    solved = least_squares(residuals, start, jac=jacobian, method="trf", tr_solver="exact", x_scale="jac",
                            ftol=1e-10, xtol=1e-10, gtol=1e-10, max_nfev=200)
     if not solved.success:
         raise RuntimeError(f"Planar constraint optimization failed: {solved.message}")
@@ -165,16 +158,22 @@ def squared_errors(fit: Calibration, observations) -> np.ndarray:
     ])
 
 
-def held_out_errors(observations, size, method: Method) -> np.ndarray:
-    """Fit on three parity groups, then predict omitted corners in the third view."""
+def corner_folds() -> list[np.ndarray]:
     indices = np.arange(len(BOARD))
     parity = GRID[:, 0] % 2 + 2 * (GRID[:, 1] % 2)
+    return [indices[(parity == fold) & ~np.isin(indices, ANCHORS)] for fold in range(4)]
+
+
+def held_out_errors(observations, size, method: Method, folds) -> np.ndarray:
+    """Fit on three groups, then predict omitted corners in the third view."""
+    indices = np.arange(len(BOARD))
     squared = [[] for _ in observations]
-    for fold in range(4):
-        omitted = (parity == fold) & ~np.isin(indices, ANCHORS)
-        fit = calibrate(indices[~omitted], observations, size, method)
+    for omitted in folds:
+        fit = calibrate(np.setdiff1d(indices, omitted), observations, size, method)
         rays = [
-            cv.undistortPoints(points[omitted].astype(np.float64), fit.matrix, fit.distortion)
+            cv.undistortPointsIter(
+                points[omitted].astype(np.float64), fit.matrix, fit.distortion, None, None, CRITERIA,
+            )
             .reshape(-1, 2).T
             for points in observations
         ]
@@ -197,6 +196,36 @@ def rmse(squared: np.ndarray) -> float:
     return float(np.sqrt(np.mean(squared)))
 
 
+def fit_all(observations, size, method: Method) -> tuple[Calibration, np.ndarray]:
+    fit = calibrate(np.arange(len(BOARD)), observations, size, method)
+    squared = squared_errors(fit, observations)
+    if not np.isclose(fit.rms, rmse(squared), rtol=0, atol=1e-6):
+        raise RuntimeError(f"Recomputed RMSE disagrees with the optimizer: {method.value}")
+    return fit, squared
+
+
+def measure_repeats(observations, size, fixed_metrics, fixed_count, shuffled_count):
+    folds = corner_folds()
+    runs = [("fixed", 1, "", *metric) for metric in fixed_metrics]
+    for run in range(2, fixed_count + 1):
+        for method in Method:
+            _, squared = fit_all(observations, size, method)
+            runs.append(("fixed", run, "", method.value, "fit", squared))
+            held_out = held_out_errors(observations, size, method, folds)
+            runs.append(("fixed", run, "", method.value, "held_out", held_out))
+
+    # Preserve the previous fold sizes and the three shared training anchors.
+    eligible = np.sort(np.concatenate(folds))
+    split_at = np.cumsum([len(fold) for fold in folds[:-1]])
+    for seed in range(shuffled_count):
+        shuffled = np.random.default_rng(seed).permutation(eligible)
+        shuffled_folds = np.split(shuffled, split_at)
+        for method in Method:
+            squared = held_out_errors(observations, size, method, shuffled_folds)
+            runs.append(("shuffled", seed + 1, seed, method.value, "held_out", squared))
+    return runs
+
+
 def write_csv(path: Path, headers, rows) -> None:
     with path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
@@ -207,25 +236,50 @@ def write_csv(path: Path, headers, rows) -> None:
 def write_tables(directory: Path, names, fits, metrics) -> None:
     parameters = [
         (name, fit.matrix[0, 0], fit.matrix[1, 1], fit.matrix[0, 2], fit.matrix[1, 2],
-         *fit.distortion.ravel()[:2])
+         *fit.distortion.ravel())
         for name, fit in fits
     ]
     write_csv(
         directory / "parameters.csv",
-        ("method", "fx_px", "fy_px", "cx_px", "cy_px", "k1", "k2"),
+        ("method", "fx_px", "fy_px", "cx_px", "cy_px", "k1", "k2", "p1", "p2", "k3"),
         parameters,
     )
     errors = []
     for name, evaluation, squared in metrics:
-        errors.extend(
-            (name, evaluation, view, len(values), rmse(values))
-            for view, values in zip(names, squared)
-        )
-        errors.append((name, evaluation, "All", squared.size, rmse(squared)))
+        errors.extend((name, evaluation, *row) for row in error_rows(names, squared))
     write_csv(
         directory / "reprojection_errors.csv",
         ("method", "evaluation", "image", "observations", "rmse_px"),
         errors,
+    )
+
+
+def error_rows(names, squared):
+    rows = [(view, len(values), rmse(values)) for view, values in zip(names, squared)]
+    return [*rows, ("All", squared.size, rmse(squared))]
+
+
+def write_repeats(directory: Path, names, runs) -> None:
+    grouped = {}
+    rows = []
+    for protocol, run, seed, method, evaluation, squared in runs:
+        errors = error_rows(names, squared)
+        rows.extend((protocol, run, seed, method, evaluation, *row) for row in errors)
+        grouped.setdefault((protocol, method, evaluation), []).append(errors[-1][-1])
+    write_csv(
+        directory / "repeat_runs.csv",
+        ("protocol", "run", "seed", "method", "evaluation", "image", "observations", "rmse_px"),
+        rows,
+    )
+    summary = []
+    for key, values in grouped.items():
+        sd = stdev(values) if len(values) > 1 else ""
+        summary.append((*key, len(values), mean(values), sd, min(values), max(values)))
+    write_csv(
+        directory / "repeat_summary.csv",
+        ("protocol", "method", "evaluation", "runs", "mean_rmse_px", "sd_rmse_px",
+         "min_rmse_px", "max_rmse_px"),
+        summary,
     )
 
 
@@ -269,7 +323,13 @@ def main() -> None:
     parser.add_argument("--images", type=Path, default=Path(__file__).with_name("images"),
                         help="Directory containing 11.jpg, 12.jpg and 18.jpg")
     parser.add_argument("--output", type=Path, default=Path("results"), help="Output directory")
+    parser.add_argument("--fixed-repeats", type=int, default=5,
+                        help="Number of runs with the same inputs and folds (default: 5)")
+    parser.add_argument("--shuffled-repeats", type=int, default=20,
+                        help="Number of randomized four-fold evaluations (default: 20)")
     args = parser.parse_args()
+    if args.fixed_repeats < 1 or args.shuffled_repeats < 0:
+        parser.error("--fixed-repeats must be positive and --shuffled-repeats nonnegative")
 
     cv.ocl.setUseOpenCL(False)
     cv.setNumThreads(1)
@@ -282,16 +342,16 @@ def main() -> None:
     metrics = []
     for method in Method:
         name = method.value
-        fit = calibrate(np.arange(len(BOARD)), observations, size, method)
-        squared = squared_errors(fit, observations)
-        if not np.isclose(fit.rms, rmse(squared), atol=1e-6):
-            raise RuntimeError(f"Recomputed RMSE disagrees with the optimizer: {name}")
+        fit, squared = fit_all(observations, size, method)
         fits.append((name, fit))
         metrics.append((name, "fit", squared))
-        metrics.append((name, "held_out", held_out_errors(observations, size, method)))
+        metrics.append((name, "held_out", held_out_errors(observations, size, method, corner_folds())))
 
+    runs = measure_repeats(observations, size, metrics, args.fixed_repeats, args.shuffled_repeats)
+    names = [view.name for view in views]
     args.output.mkdir(parents=True, exist_ok=True)
-    write_tables(args.output, [view.name for view in views], fits, metrics)
+    write_tables(args.output, names, fits, metrics)
+    write_repeats(args.output, names, runs)
     write_figures(args.output, views, fits)
     for name, evaluation, squared in metrics:
         print(f"{name} | {evaluation}: {rmse(squared):.6f} px")
